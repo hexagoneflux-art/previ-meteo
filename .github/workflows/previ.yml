@@ -14,6 +14,10 @@ on:
         description: "Lister les couvertures disponibles (1er test)"
         type: boolean
         default: false
+      sonde:
+        description: "Sonde : 1 appel par modèle (vérifie clé, format, valeurs) — avant le 1er run complet"
+        type: boolean
+        default: false
       force:
         description: "Forcer même sans nouveau run"
         type: boolean
@@ -41,8 +45,14 @@ jobs:
           MF_KEY_AROME: ${{ secrets.MF_KEY_AROME }}
           MF_KEY_ARPEGE: ${{ secrets.MF_KEY_ARPEGE }}
         run: python previ.py --discover
+      - name: Sonde (1 appel par modèle)
+        if: ${{ inputs.sonde }}
+        env:
+          MF_KEY_AROME: ${{ secrets.MF_KEY_AROME }}
+          MF_KEY_ARPEGE: ${{ secrets.MF_KEY_ARPEGE }}
+        run: python previ.py --sonde
       - name: Préparer les prévisions
-        if: ${{ !inputs.discover }}
+        if: ${{ !inputs.discover && !inputs.sonde }}
         env:
           MF_KEY_AROME: ${{ secrets.MF_KEY_AROME }}
           MF_KEY_ARPEGE: ${{ secrets.MF_KEY_ARPEGE }}
