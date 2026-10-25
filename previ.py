@@ -21,6 +21,7 @@ Secrets / variables d'environnement :
 
 Modes :
   python previ.py --discover               liste les couvertures disponibles (à lancer en premier)
+  python previ.py --sonde                  un appel par modèle : vérifie clé, format GeoTIFF et valeurs (à lancer avant le run complet)
   python previ.py --out dossier            écrit les tuiles en local au lieu de KV (test)
   python previ.py --selftest               test complet hors-ligne avec de fausses données
   python previ.py                          exécution normale (s'arrête vite s'il n'y a pas de nouveau run)
@@ -50,8 +51,12 @@ PARAMS = {
     "t":    {"pref": ["TEMPERATURE__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND"], "h": 2, "dec": 1},
     "rh":   {"pref": ["RELATIVE_HUMIDITY__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND"], "h": 2, "dec": 0},
     "ws":   {"pref": ["WIND_SPEED__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND"], "h": 10, "dec": 0},
-    "wd":   {"pref": ["WIND_DIRECTION__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND"], "h": 10, "dec": 0},
-    "gust": {"pref": ["WIND_SPEED_GUST__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND"], "h": 10, "dec": 0},
+    "u":    {"pref": ["U_COMPONENT_OF_WIND__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND"], "h": 10, "dec": 1, "interne": True},
+    "v":    {"pref": ["V_COMPONENT_OF_WIND__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND"], "h": 10, "dec": 1, "interne": True},
+    "wd":   {"pref": [], "h": 10, "dec": 0},  # calculée depuis u et v (aucune couverture WIND_DIRECTION)
+    # rafale maximale sur la période du modèle (1 h AROME, 3 h ARPEGE) ; repli : rafale instantanée
+    "gust": {"pref": ["WIND_SPEED_GUST_MAX__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND", "WIND_SPEED_MAXIMUM_GUST__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND",
+                      "WIND_SPEED_GUST__SPECIFIC_HEIGHT_LEVEL_ABOVE_GROUND"], "h": 10, "dec": 0, "periode": True},
     "rain": {"pref": ["TOTAL_PRECIPITATION__GROUND_OR_WATER_SURFACE"], "h": None, "dec": 2, "cumul": True},
     "cc":   {"pref": ["TOTAL_CLOUD_COVER__GROUND_OR_WATER_SURFACE"], "h": None, "dec": 0},
     "p":    {"pref": ["PRESSURE__MEAN_SEA_LEVEL"], "h": None, "dec": 1},
@@ -70,6 +75,7 @@ def cle_api(url):
 
 FAUX = False
 _dernier = [0.0]
+_diag = [0]
 
 
 # ── réseau ────────────────────────────────────────────────────────────
@@ -87,6 +93,9 @@ def get(url, params):
             time.sleep(20 * (essai + 1))
             continue
         if r.status_code in (400, 404):
+            if "GetCoverage" in url and _diag[0] < 5:
+                _diag[0] += 1
+                print(f"  ! refus HTTP {r.status_code} — {url.split('/wcs/')[-1]} {[v for k, v in params if k in ('coverageid', 'subset')]} : {r.text[:300]!r}")
             return None
         r.raise_for_status()
         return r.content
@@ -121,17 +130,17 @@ def derniere_ref(couv):
 
 
 def choisir(couv, cle, ref, modele):
-    """Retourne l'identifiant de couverture à utiliser pour (cle, ref), ou None."""
+    """Identifiant de couverture pour (cle, ref), ou None. Les paramètres cumulés / « max sur période » exigent la période du modèle."""
     p = PARAMS[cle]
     for pref in p["pref"]:
         c = [x for x in couv if x[0] == pref and x[1] == ref]
         if not c:
             continue
-        if p.get("cumul"):
+        if {x[2] for x in c} != {None}:  # la couverture existe par période (PT1H, PT3H, P1D…)
             voulue = MODELES[modele]["periode"]
             c = [x for x in c if x[2] == voulue]
             if not c:
-                return None  # période inconnue : on n'invente pas, la pluie restera vide
+                continue
         return c[0][3]
     return None
 
@@ -168,7 +177,7 @@ def echantillonner(a, x0, y0, sx, sy):
     return sub
 
 
-def grille(modele, cid, cle, valide):
+def telecharger(modele, cid, cle, valide):
     p = PARAMS[cle]
     params = [("service", "WCS"), ("version", "2.0.1"), ("coverageid", cid),
               ("subset", f"time({valide.strftime('%Y-%m-%dT%H:%M:%SZ')})"),
@@ -176,13 +185,48 @@ def grille(modele, cid, cle, valide):
               ("format", "image/tiff")]
     if p["h"] is not None:
         params.insert(4, ("subset", f"height({p['h']})"))
-    brut = get(url_wcs(modele, "GetCoverage"), params)
+    return get(url_wcs(modele, "GetCoverage"), params)
+
+
+def grille(modele, cid, cle, valide):
+    brut = telecharger(modele, cid, cle, valide)
     if brut is None:
         return None
     g = echantillonner(*lire_tiff(brut))
-    if p.get("cumul"):
+    if PARAMS[cle].get("cumul"):
         g = g / (3.0 if MODELES[modele]["periode"] == "PT3H" else 1.0)  # mm sur la période → mm/h
     return g
+
+
+def direction_vent(u, v):
+    """Direction d'où vient le vent, en degrés (convention météo) à partir des composantes U (est) et V (nord)."""
+    return (270.0 - np.degrees(np.arctan2(v, u))) % 360.0
+
+
+def sonde(couv):
+    """Un seul appel par modèle : vérifie clé, format, géoréférencement et valeur à Perpignan. À lancer avant un run complet."""
+    for modele in MODELES:
+        ref = derniere_ref(couv[modele])
+        valide = iso_ref(ref) + timedelta(hours=3)
+        print(f"\n== sonde {modele} : run {ref}, échéance {valide:%d/%m %Hh} UTC")
+        for cle in ("t", "rain", "gust", "u"):
+            cid = choisir(couv[modele], cle, ref, modele)
+            print(f"  [{cle}] couverture : {cid}")
+            if not cid:
+                continue
+            brut = telecharger(modele, cid, cle, valide)
+            if brut is None:
+                print("      refusé (voir le message « refus HTTP » ci-dessus)")
+                continue
+            try:
+                a, x0, y0, sx, sy = lire_tiff(brut)
+            except Exception as e:  # noqa: BLE001
+                print(f"      réponse non lisible comme GeoTIFF : {e} ; début = {brut[:80]!r}")
+                continue
+            g = echantillonner(a, x0, y0, sx, sy)
+            i, j = int(round((42.7 - LAT_MIN) / STEP)), int(round((2.9 - LON_MIN) / STEP))
+            print(f"      OK {len(brut) // 1024} Ko, grille {a.shape}, origine ({x0:.3f}, {y0:.3f}), pas ({sx:.4f}, {sy:.4f}), "
+                  f"min {np.nanmin(a):.2f} max {np.nanmax(a):.2f}, valeur à Perpignan : {g[i, j]:.2f}")
 
 
 def convertir(cle, g):
@@ -290,6 +334,9 @@ def principal(args):
             for n in sorted({(n, p) for n, r, p, _ in c if r == ref}):
                 print("  ", n[0], n[1] or "")
         return 0
+    if args.sonde:
+        sonde(couv)
+        return 0
     refs = {m: derniere_ref(couv[m]) for m in MODELES}
     if not refs["arome"] and not refs["arpege"]:
         print("Aucun run aux heures publiées (HEURES_RUN) : rien à faire.")
@@ -338,7 +385,9 @@ def principal(args):
     if len(temps_ok) < 10:
         print("Trop peu d'échéances récupérées : abandon, rien n'est publié.")
         return 1
-    series = {c: s_ for c, s_ in series.items() if s_}
+    for t in set(series["u"]) & set(series["v"]):  # direction du vent depuis U et V
+        series["wd"][t] = direction_vent(series["u"][t], series["v"][t]).astype("float32")
+    series = {c: s_ for c, s_ in series.items() if s_ and not PARAMS[c].get("interne")}
     temps = sorted(temps_ok)
     paires = list(construire(series, temps, refs))
     ecrire_lot(args.out, paires)
@@ -355,7 +404,10 @@ def faux_get(url, params):
         ids = []
         for p in PARAMS.values():
             for pref in p["pref"]:
-                ids += [f"{pref}___{ref}"] if not p.get("cumul") else [f"{pref}___{ref}_PT1H", f"{pref}___{ref}_PT3H"]
+                if p.get("cumul") or (p.get("periode") and "GUST_MAX" in pref):
+                    ids += [f"{pref}___{ref}_PT1H", f"{pref}___{ref}_PT3H"]
+                elif not p.get("periode") or pref.startswith("WIND_SPEED_GUST__"):
+                    ids += [f"{pref}___{ref}"]
         return ("<c>" + "".join(f"<wcs:CoverageId>{i}</wcs:CoverageId>" for i in ids) + "</c>").encode()
     d = dict(params)
     cid = d["coverageid"]
@@ -364,8 +416,9 @@ def faux_get(url, params):
     base = {"TEMPERATURE": 285 + (50 - lat) * 0.8 + 0 * lon, "RELATIVE_HUMIDITY": 70 + 0 * lat + 0 * lon,
             "WIND_SPEED_GUST": 12 + 0 * lat + 0 * lon, "WIND_SPEED": 5 + 0 * lat + 0 * lon, "WIND_DIRECTION": 200 + 0 * lat + 0 * lon,
             "TOTAL_PRECIPITATION": np.where(lon > 5, 1.5, 0.0) + 0 * lat, "TOTAL_CLOUD_COVER": 40 + 0 * lat + 0 * lon,
-            "PRESSURE": 101300 + 0 * lat + 0 * lon}
-    cle = next(k for k in base if cid.startswith(k))
+            "PRESSURE": 101300 + 0 * lat + 0 * lon,
+            "U_COMPONENT_OF_WIND": 3 + 0 * lat + 0 * lon, "V_COMPONENT_OF_WIND": 4 + 0 * lat + 0 * lon}
+    cle = next(k for k in sorted(base, key=len, reverse=True) if cid.startswith(k))
     buf = io.BytesIO()
     tifffile.imwrite(buf, base[cle].astype("float32"), extratags=[(33550, "d", 3, (0.025, 0.025, 0.0), True), (33922, "d", 6, (0, 0, 0, -6.1, 52.1, 0.0), True)])
     return buf.getvalue()
@@ -374,6 +427,7 @@ def faux_get(url, params):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--discover", action="store_true")
+    ap.add_argument("--sonde", action="store_true", help="un appel par modèle pour vérifier clé, format et valeurs")
     ap.add_argument("--out")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--selftest", action="store_true")
