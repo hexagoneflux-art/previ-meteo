@@ -1,0 +1,52 @@
+name: previ-meteo
+
+# 12 passages par jour, autour de la disponibilité des runs 00/06/12/18 h UTC (AROME ~+3 h, ARPEGE ~+4 h).
+# Chaque passage s'arrête en quelques secondes s'il n'y a rien de nouveau (facturé 1 min minimum).
+# Estimation (à mesurer) : 4 runs réels × ~10 min + ~8 passages à vide × 1 min ≈ 48 min/jour ≈ 1 450 min/mois,
+# sous les 2 000 min gratuites d'un dépôt PRIVÉ. Un dépôt public n'a pas cette limite.
+# Seuls les runs de 00, 06, 12 et 18 h UTC sont publiés (4 × 177 écritures = 708/jour < 1 000, limite KV gratuite).
+on:
+  schedule:
+    - cron: "30 3,4,5,9,10,11,15,16,17,21,22,23 * * *"
+  workflow_dispatch:
+    inputs:
+      discover:
+        description: "Lister les couvertures disponibles (1er test)"
+        type: boolean
+        default: false
+      force:
+        description: "Forcer même sans nouveau run"
+        type: boolean
+        default: false
+
+concurrency:
+  group: previ-meteo
+  cancel-in-progress: false
+
+jobs:
+  previ:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Lister les couvertures
+        if: ${{ inputs.discover }}
+        env:
+          MF_KEY_AROME: ${{ secrets.MF_KEY_AROME }}
+          MF_KEY_ARPEGE: ${{ secrets.MF_KEY_ARPEGE }}
+        run: python previ.py --discover
+      - name: Préparer les prévisions
+        if: ${{ !inputs.discover }}
+        env:
+          MF_KEY_AROME: ${{ secrets.MF_KEY_AROME }}
+          MF_KEY_ARPEGE: ${{ secrets.MF_KEY_ARPEGE }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: python previ.py ${{ inputs.force && '--force' || '' }}
