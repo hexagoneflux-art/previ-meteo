@@ -1,13 +1,14 @@
 name: previ-meteo
 
-# 12 passages par jour, autour de la disponibilité des runs 00/06/12/18 h UTC (AROME ~+3 h, ARPEGE ~+4 h).
-# Chaque passage s'arrête en quelques secondes s'il n'y a rien de nouveau (facturé 1 min minimum).
-# Estimation (à mesurer) : 4 runs réels × ~10 min + ~8 passages à vide × 1 min ≈ 48 min/jour ≈ 1 450 min/mois,
-# sous les 2 000 min gratuites d'un dépôt PRIVÉ. Un dépôt public n'a pas cette limite.
+# Un passage toutes les 30 min dans les fenêtres où les runs 00/06/12/18 h UTC deviennent disponibles
+# (AROME ~+3 h, ARPEGE ~+4 h) : 3-5 h, 9-11 h, 15-17 h et 21-23 h UTC, soit 24 passages par jour.
+# Chaque passage s'arrête en quelques secondes s'il n'y a rien de nouveau (aucune écriture KV).
+# Dépôt PUBLIC : minutes GitHub Actions gratuites et illimitées. Les workflows programmés sont
+# désactivés après 60 jours sans activité : voir keepalive.yml.
 # Seuls les runs de 00, 06, 12 et 18 h UTC sont publiés (4 × 177 écritures = 708/jour < 1 000, limite KV gratuite).
 on:
   schedule:
-    - cron: "30 3,4,5,9,10,11,15,16,17,21,22,23 * * *"
+    - cron: "0,30 3-5,9-11,15-17,21-23 * * *"
   workflow_dispatch:
     inputs:
       discover:
